@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""ccswap — run Claude Code across several subscription accounts and switch between them
+live, so a running session never stops at a usage limit.
+
+Usage:
+  ccswap [claude args...]      start claude on the best account; switch live as limits run out
+  ccswap use <name> [args...]  start on a specific account (still switches when it runs out)
+  ccswap add <name>            add an account: opens claude so you can /login with it
+  ccswap rm <name>             remove an account (deletes its saved login)
+  ccswap ls                    usage of every account, pick order and running sessions
+  ccswap default [<name>|none] show / set the default account (always used first while it has room)
+  ccswap cap                   show every account's weekly cap
+  ccswap cap <name> <pct|reset>   cap one account's weekly use (e.g. leave room for its owner)
+  ccswap cap --others <pct|reset> cap for every account except the default one
+  ccswap unblock <name>        clear a limit-hit block on an account
+  ccswap install               wire the status line and hook into ~/.claude/settings.json
+  ccswap uninstall [--purge]   undo install (--purge also deletes saved logins and state)
+  ccswap doctor                check that everything is set up correctly
+  ccswap version
+
+Environment:
+  CCSWAP_HOME           where accounts and state live (default ~/.ccswap)
+  CCSWAP_CLAUDE_DIR     the Claude config dir shared by all accounts (default ~/.claude)
+  CCSWAP_THRESHOLD      % of a window at which an account counts as spent (default 99)
+  CCSWAP_REBALANCE_MIN  minimum minutes between optional rebalancing switches (default 10)
+
+See https://github.com/alikkaz/ccswap for how it works.
+"""
+import fcntl, json, os, re, shlex, shutil, signal, subprocess, sys, threading, time, urllib.request
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+HOME = Path.home()
+ROOT = Path(os.environ.get("CCSWAP_HOME", HOME / ".ccswap")).expanduser()
+STATE = ROOT / "state"
+SLOTS = ROOT / "slots"
+MAIN_DIR = Path(os.environ.get("CCSWAP_CLAUDE_DIR", HOME / ".claude")).expanduser()
+THRESHOLD = float(os.environ.get("CCSWAP_THRESHOLD", "99"))
+POLL = 1.0                              # seconds between checks while claude runs
+REBALANCE_EVERY = 60                    # seconds between urgency checks while running
+REBALANCE_MIN = float(os.environ.get("CCSWAP_REBALANCE_MIN", "10")) * 60
+POLL_EVERY = 180                        # seconds between usage polls per account
+K_PRIOR, K_WEIGHT = 0.10, 30.0          # weekly % per 1% of session: prior guess and its weight
+PACE_PRIOR, PACE_WEIGHT = 40.0, 1.0     # your pace in session-%/hour while working (prior, hours)
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA = "oauth-2025-04-20"
+RESERVED = {"main", "bin", "state", "slots"}
+
+# Shared with the main Claude dir. Credentials and .claude.json stay per account / per slot.
+SHARED = ["settings.json", "CLAUDE.md", "keybindings.json", "skills", "agents", "commands",
+          "output-styles", "hooks", "plugins", "projects", "plans", "file-history", "todos",
+          "history.jsonl", "paste-cache"]
+
+
+# ---------- helpers ----------
+
+def read_json(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return default
+
+
+def write_json(p, data, mode=None):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    if mode:
+        tmp.chmod(mode)
+    tmp.replace(p)
+
+
+def symlink(target, link):
+    """Atomically point `link` at `target`."""
+    link = Path(link)
+    tmp = link.with_name(f".{link.name}.{os.getpid()}.lnk")
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(target)
+    tmp.replace(link)
+
+
+@contextmanager
+def locked():
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with open(ROOT / ".lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def config_dir(name):
+    return ROOT / name / "config"
+
+
+def creds(name):
+    return config_dir(name) / ".credentials.json"
+
+
+def accounts():
+    if not ROOT.exists():
+        return []
+    return sorted(p.parent.name for p in ROOT.glob("*/config") if p.is_dir() and p.parent.name not in RESERVED)
+
+
+def email(name):
+    gc = read_json(config_dir(name) / ".claude.json", {}) or {}
+    return (gc.get("oauthAccount") or {}).get("emailAddress", "?")
+
+
+def current_account():
+    """The account this Claude process is on ("main" = not started through ccswap)."""
+    slot = os.environ.get("CCSWAP_SLOT")
+    if slot:
+        try:
+            return (Path(slot) / "acct").read_text().strip()
+        except OSError:
+            pass
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        p = Path(cfg).expanduser().resolve()
+        if p.name == "config" and p.parent.parent == ROOT.resolve():
+            return p.parent.name
+    return "main"
+
+
+def state(name):
+    return read_json(STATE / f"{name}.json", {}) or {}
+
+
+def settings():
+    return read_json(ROOT / "config.json", {}) or {}
+
+
+def save_settings(cfg):
+    write_json(ROOT / "config.json", cfg)
+
+
+def default_account():
+    d = settings().get("default")
+    return d if d in accounts() else None
+
+
+def weekly_cap(name):
+    cfg = settings()
+    caps = cfg.get("weekly_cap") or {}
+    if name in caps:
+        return float(caps[name])
+    if name != default_account() and cfg.get("others_cap") is not None:
+        return float(cfg["others_cap"])
+    return THRESHOLD
+
+
+def blocked_until(name, now=None):
+    """Epoch when the account becomes usable again, or 0 if usable now."""
+    now = now or time.time()
+    s = state(name)
+    until = s.get("blocked_until", 0) if s.get("blocked_until", 0) > now else 0
+    for w, limit in (("five_hour", THRESHOLD), ("seven_day", weekly_cap(name))):
+        win = s.get(w) or {}
+        if win.get("used_percentage", 0) >= limit and win.get("resets_at", 0) > now:
+            until = max(until, win["resets_at"])
+    # Per-model weekly limits only matter for the model you are actually using.
+    model = ((read_json(STATE / "_model.json", {}) or {}).get("model") or "").lower()
+    for lim in s.get("scoped") or []:
+        if (lim.get("model") and lim["model"].lower() in model and lim.get("percent", 0) >= THRESHOLD
+                and (lim.get("resets_at") or 0) > now):
+            until = max(until, lim["resets_at"])
+    return until
+
+
+def merge_window(old, new, now):
+    """Usage only grows within a window. Ignore reports from an older or already-reset window."""
+    if not new or new.get("resets_at", 0) <= now:
+        return old
+    if old and old.get("resets_at", 0) > now:
+        if old["resets_at"] > new["resets_at"] + 60:
+            return old
+        if abs(old["resets_at"] - new["resets_at"]) <= 60:
+            return {**new, "used_percentage": max(old.get("used_percentage", 0), new.get("used_percentage", 0))}
+    return new
+
+
+def iso_ts(value):
+    return datetime.fromisoformat(value).timestamp() if value else None
+
+
+def oauth_get(url, token, timeout):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "anthropic-beta": OAUTH_BETA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def fetch_usage(acct):
+    """Authoritative usage for one account from Anthropic (the numbers /usage shows).
+    Only uses a still-valid access token; never refreshes tokens itself."""
+    tok = (read_json(creds(acct), {}) or {}).get("claudeAiOauth") or {}
+    if not tok.get("accessToken") or tok.get("expiresAt", 0) <= time.time() * 1000 + 60_000:
+        return False
+    try:
+        data = oauth_get(USAGE_URL, tok["accessToken"], timeout=8)
+    except Exception:
+        return False
+    now = time.time()
+    with locked():
+        st = state(acct)
+        for w in ("five_hour", "seven_day"):
+            d = data.get(w) or {}
+            reset = iso_ts(d.get("resets_at"))
+            if reset and reset > now:
+                st[w] = {"used_percentage": d.get("utilization") or 0, "resets_at": reset}
+            else:
+                st.pop(w, None)   # window not running
+        st["scoped"] = [{"model": ((l.get("scope") or {}).get("model") or {}).get("display_name"),
+                         "percent": l.get("percent", 0), "resets_at": iso_ts(l.get("resets_at"))}
+                        for l in data.get("limits") or [] if l.get("kind") == "weekly_scoped"]
+        st["extra_usage"] = bool((data.get("extra_usage") or {}).get("is_enabled"))
+        st["polled"] = st["updated"] = now
+        if st.get("blocked_until", 0) > now and not any(
+                (st.get(w) or {}).get("used_percentage", 0) >= THRESHOLD for w in ("five_hour", "seven_day")):
+            st.pop("blocked_until")  # the poll says there is room after all
+        write_json(STATE / f"{acct}.json", st)
+    return True
+
+
+def poll_all(max_age=POLL_EVERY, wait=True):
+    """Refresh usage for every account whose data is older than max_age, in parallel."""
+    now = time.time()
+    due = [a for a in accounts() if now - state(a).get("polled", 0) >= max_age]
+    threads = [threading.Thread(target=fetch_usage, args=(a,), daemon=True) for a in due]
+    for t in threads:
+        t.start()
+    if wait:
+        for t in threads:
+            t.join(10)
+
+
+def fmt_reset(ts):
+    if not ts:
+        return "-"
+    t = time.localtime(ts)
+    if time.strftime("%Y%m%d", t) == time.strftime("%Y%m%d"):
+        return time.strftime("%H:%M", t)
+    return time.strftime("%a %H:%M", t)
+
+
+def notify(title, body):
+    if not shutil.which("notify-send"):
+        return
+    try:
+        subprocess.run(["notify-send", "-a", "Claude Code", title, body], timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+# ---------- scheduling ----------
+
+def ratio(st):
+    """Learned weekly-% cost of 1% of this account's 5-hour window."""
+    return (st.get("k_d7", 0) + K_PRIOR * K_WEIGHT) / (st.get("k_d5", 0) + K_WEIGHT)
+
+
+def pace():
+    """Learned session-% per hour you burn while actively working (all accounts)."""
+    g = read_json(STATE / "_pace.json", {}) or {}
+    return (g.get("d5", 0) + PACE_PRIOR * PACE_WEIGHT) / (g.get("hours", 0) + PACE_WEIGHT)
+
+
+def windows(st, now):
+    """(5h used %, 5h reset, 7d used %, 7d reset); a window past its reset counts as fresh."""
+    f, w = st.get("five_hour") or {}, st.get("seven_day") or {}
+    f5, r5 = (f.get("used_percentage", 0), f["resets_at"]) if f.get("resets_at", 0) > now else (0, None)
+    f7, r7 = (w.get("used_percentage", 0), w["resets_at"]) if w.get("resets_at", 0) > now else (0, None)
+    return f5, r5, f7, r7
+
+
+def plan(name, now=None):
+    """Urgency of an account = the most weekly-% per hour that would be lost by not using it."""
+    now = now or time.time()
+    st = state(name)
+    k = ratio(st)
+    f5, r5, f7, r7 = windows(st, now)
+    cap = weekly_cap(name)
+    week_left = max(0.0, cap - f7)
+    hours7 = (r7 - now) / 3600 if r7 else 7 * 24
+    session_pool = min((100 - f5) * k, week_left)
+    if r5:
+        hours5 = max((r5 - now) / 3600, 0.25)
+        u5 = session_pool / hours5
+        s_why = f"session {100 - f5:.0f}% left, lost in {hours5:.1f}h"
+    else:
+        u5 = 0.0   # idle window: nothing expires until it is started
+        s_why = "session idle (fresh 5h window)"
+    u7 = week_left / max(hours7, 0.25)
+    raw = max(u5, u7)
+    urgency = min(raw, pace() * k)       # you can't burn an account faster than your own pace
+    cap_txt = f" before the {cap:.0f}% cap" if cap < THRESHOLD else ""
+    return {"urgency": urgency, "raw": raw, "k": k, "session_pool": session_pool, "week_left": week_left,
+            "why": f"{s_why}; week {week_left:.0f}% left{cap_txt}, lost in {hours7 / 24:.1f}d"}
+
+
+def score(name, now=None):
+    """Sort key: capped urgency, then raw urgency (sooner/larger loss) to break ties at the cap."""
+    p = plan(name, now)
+    return (p["urgency"], p["raw"])
+
+
+def usable_accounts(exclude=(), now=None):
+    now = now or time.time()
+    return [a for a in accounts() if a not in exclude and not blocked_until(a, now) and creds(a).exists()]
+
+
+def ordered(accts, now=None):
+    """Default account first, then the rest by urgency."""
+    now = now or time.time()
+    d = default_account()
+    return sorted(accts, key=lambda a: (a == d, score(a, now)), reverse=True)
+
+
+def pick(exclude=()):
+    now = time.time()
+    usable = ordered(usable_accounts(exclude, now), now)
+    return usable[0] if usable else None
+
+
+def better_account(cur, now):
+    """Another account worth moving the running session to, or None."""
+    best = pick(exclude={cur})
+    if not best:
+        return None
+    d = default_account()
+    if d and best == d:
+        return d            # the default has room again: go back to it
+    if d and cur == d:
+        return None         # on the default with room left: stay
+    here, there = plan(cur, now), plan(best, now)
+    if there["session_pool"] < 1:  # nothing meaningful to gain there right now
+        return None
+    if there["urgency"] > here["urgency"] * 1.25 + 0.2:
+        return best
+    # Both at your pace cap: prefer the one whose allowance runs out clearly sooner.
+    if abs(there["urgency"] - here["urgency"]) < 0.05 and there["raw"] > here["raw"] * 1.5:
+        return best
+    return None
+
+
+# ---------- slots ----------
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def slot_owner(slot):
+    try:
+        return int((slot / "owner").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def running_slots():
+    if not SLOTS.exists():
+        return []
+    return [sl for sl in sorted(SLOTS.iterdir(), key=lambda p: p.name)
+            if slot_owner(sl) and pid_alive(slot_owner(sl)) and (sl / "acct").exists()]
+
+
+def acquire_slot():
+    with locked():
+        n = 1
+        while True:
+            slot = SLOTS / str(n)
+            owner = slot_owner(slot)
+            if owner is None or not pid_alive(owner):
+                (slot / "config").mkdir(parents=True, exist_ok=True)
+                (slot / "owner").write_text(str(os.getpid()))
+                return slot
+            n += 1
+
+
+def link_shared(cfg):
+    for item in SHARED:
+        src, dst = MAIN_DIR / item, cfg / item
+        if src.exists() and not dst.exists() and not dst.is_symlink():
+            dst.symlink_to(src)
+
+
+def main_global_config():
+    return read_json(HOME / ".claude.json", {}) or {}
+
+
+def prepare_slot(slot, acct):
+    cfg = slot / "config"
+    link_shared(cfg)
+    # Per-slot global config, seeded from the account (onboarding, MCP servers, account info)
+    # and from ~/.claude.json (folder trust), so a new slot doesn't re-ask anything.
+    gc = cfg / ".claude.json"
+    mine = read_json(gc, {}) or {}
+    theirs = read_json(config_dir(acct) / ".claude.json", {}) or {}
+    for k in ("oauthAccount", "hasCompletedOnboarding", "lastOnboardingVersion", "mcpServers"):
+        if k in theirs:
+            mine[k] = theirs[k]
+    home_projects = main_global_config().get("projects") or {}
+    mine["projects"] = {**home_projects, **(theirs.get("projects") or {}), **(mine.get("projects") or {})}
+    write_json(gc, mine)
+    point_slot(slot, acct)
+
+
+def point_slot(slot, acct):
+    symlink(creds(acct), slot / "config" / ".credentials.json")
+    write_json(slot / "switch.json", {"account": acct, "at": time.time()})
+    (slot / "acct").write_text(acct)
+
+
+def sync_creds(slot):
+    """Claude replaces the credentials symlink with a plain file when it refreshes a token
+    or logs in to an MCP server. Save a good file back to the account it belongs to, then
+    restore the symlink (an emptied file from a failed refresh is just dropped)."""
+    p = slot / "config" / ".credentials.json"
+    acct = (slot / "acct").read_text().strip()
+    if p.is_symlink() and Path(os.readlink(p)) == creds(acct):
+        return
+    if p.exists() and not p.is_symlink():
+        data = read_json(p, {}) or {}
+        tok = data.get("claudeAiOauth") or {}
+        if tok.get("accessToken") and tok.get("refreshToken") and tok.get("expiresAt", 0) > time.time() * 1000:
+            owner = None
+            try:
+                who = oauth_get(PROFILE_URL, tok["accessToken"], timeout=5)["account"]["email"]
+                owner = next((a for a in accounts() if email(a) == who), None)
+            except Exception:
+                # Can't verify: trust it only if we haven't switched recently.
+                if time.time() - (read_json(slot / "switch.json", {}) or {}).get("at", 0) > 120:
+                    owner = acct
+            if owner and read_json(creds(owner)) != data:
+                write_json(creds(owner), data, mode=0o600)
+    symlink(creds(acct), p)
+
+
+def tick(slot, flags):
+    sync_creds(slot)
+    cur = (slot / "acct").read_text().strip()
+    now = time.time()
+    if now - flags.get("polled", 0) >= 30:
+        flags["polled"] = now
+        poll_all(wait=False)
+    if not blocked_until(cur):
+        flags.pop("all_spent", None)
+        if now - flags.get("checked", 0) < REBALANCE_EVERY:
+            return
+        flags["checked"] = now
+        last = (read_json(slot / "switch.json", {}) or {}).get("at", 0)
+        if now - last < REBALANCE_MIN:
+            return
+        nxt = better_account(cur, now)
+        if nxt:
+            point_slot(slot, nxt)
+            why = "back to the default account" if nxt == default_account() else "its allowance expires sooner"
+            notify(f"Claude: switched {cur} → {nxt}", why)
+        return
+    nxt = pick(exclude={cur})
+    if nxt:
+        point_slot(slot, nxt)
+        notify(f"Claude: switched {cur} → {nxt}", f"'{cur}' is spent until {fmt_reset(blocked_until(cur))}")
+    elif not flags.get("all_spent"):
+        flags["all_spent"] = True
+        soonest = min((blocked_until(a) for a in accounts()), default=0)
+        notify("Claude: every account is spent", f"First one frees up at {fmt_reset(soonest)}")
+
+
+# ---------- called by Claude Code ----------
+
+def learn_ratio(s, rl, learn_pace=True):
+    """Accumulate how far the weekly % moves per 1% of the 5-hour window (same windows only)."""
+    old_f, old_w = s.get("five_hour") or {}, s.get("seven_day") or {}
+    new_f, new_w = rl.get("five_hour") or {}, rl.get("seven_day") or {}
+    if (old_f.get("resets_at") == new_f.get("resets_at") and old_w.get("resets_at") == new_w.get("resets_at")
+            and "used_percentage" in old_f and "used_percentage" in old_w):
+        d5 = new_f.get("used_percentage", 0) - old_f["used_percentage"]
+        d7 = new_w.get("used_percentage", 0) - old_w["used_percentage"]
+        if d5 > 0 and d7 >= 0:
+            s["k_d5"] = s.get("k_d5", 0) + d5
+            s["k_d7"] = s.get("k_d7", 0) + d7
+        # Pace: only between samples close together (i.e. while you were actually working).
+        gap = time.time() - s.get("updated", 0)
+        if learn_pace and d5 >= 0 and gap < 600:
+            g = read_json(STATE / "_pace.json", {}) or {}
+            g["d5"] = g.get("d5", 0) + d5
+            g["hours"] = g.get("hours", 0) + gap / 3600
+            write_json(STATE / "_pace.json", g)
+
+
+def record_rate_limits(acct, rl, now):
+    """Store the status line's numbers for `acct`, unless they are really another account's."""
+    def same(a, b):
+        return a and b and abs(a.get("resets_at", 0) - b.get("resets_at", 0)) <= 60
+
+    # Right after a live switch Claude still reports the previous account's numbers until
+    # the next response arrives. Windows are identified by their reset times.
+    mine = state(acct)
+    if not any(same(rl.get(w), mine.get(w)) for w in rl):
+        if any(all(same(rl.get(w), state(o).get(w)) for w in rl) for o in accounts() if o != acct):
+            return
+    with locked():
+        s = state(acct)
+        learn_ratio(s, rl)
+        for w in rl:
+            merged = merge_window(s.get(w), rl[w], now)
+            if merged:
+                s[w] = merged
+        s["updated"] = now
+        write_json(STATE / f"{acct}.json", s)
+
+
+def render_statusline(acct, payload, now):
+    slot = os.environ.get("CCSWAP_SLOT")
+    s = state(acct)
+    rl = {w: s[w] for w in ("five_hour", "seven_day") if s.get(w)}
+    if acct == "main":  # not a ccswap session: show what Claude reports
+        rl = {w: v for w, v in (payload.get("rate_limits") or {}).items() if w in ("five_hour", "seven_day")}
+    G, Y, R, C, D, B, X = ("\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[2m", "\033[1m", "\033[0m")
+    SEP = f"  {D}│{X}  "
+
+    def until(ts):
+        secs = max(0, int(ts - now))
+        if secs < 86400:
+            return f"resets in {secs // 3600}h {secs % 3600 // 60:02d}m"
+        return time.strftime("resets %a %H:%M", time.localtime(ts))
+
+    def win(label, w):
+        limit = weekly_cap(acct) if w == "seven_day" and acct != "main" else THRESHOLD
+        d = rl.get(w)
+        if not d:
+            return f"{label} {D}—{X}"
+        pct = d.get("used_percentage", 0) if d.get("resets_at", 0) > now else 0
+        col = R if pct >= limit else Y if pct >= limit - 10 else G
+        filled = round(min(pct, 100) / 10)
+        bar = f"{col}{'━' * filled}{X}{D}{'━' * (10 - filled)}{X}"
+        capped = f"{D}/{limit:.0f}%{X}" if limit < THRESHOLD else ""
+        return f"{label} {bar} {col}{B}{pct:.0f}%{X}{capped} {D}{until(d.get('resets_at', now))}{X}"
+
+    name = "not via ccswap" if acct == "main" else acct
+    parts = [f"{C}{B}● {name}{X}", win("session", "five_hour"), win("week", "seven_day")]
+    if acct != "main" and blocked_until(acct, now):
+        nxt = pick(exclude={acct})
+        if not nxt:
+            parts.append(f"{R}{B}all accounts spent{X}")
+        elif slot:
+            parts.append(f"{R}{B}switching to {nxt}…{X}")
+    model = (payload.get("model") or {}).get("display_name")
+    if model:
+        parts.append(f"{D}{re.sub(r' [(].*[)]$', '', model)}{X}")
+    return SEP.join(parts)
+
+
+def cmd_statusline():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = {}
+    now = time.time()
+    acct = current_account()
+    model = (payload.get("model") or {}).get("display_name")
+    if model and (read_json(STATE / "_model.json", {}) or {}).get("model") != model:
+        write_json(STATE / "_model.json", {"model": model})
+    rl = {w: payload["rate_limits"][w] for w in ("five_hour", "seven_day")
+          if w in (payload.get("rate_limits") or {})}
+    if rl and acct != "main":
+        record_rate_limits(acct, rl, now)
+    print(render_statusline(acct, payload, now))
+    # Keep whatever status line the user had before `ccswap install`, on the next line.
+    chained = settings().get("chained_statusline")
+    if chained:
+        try:
+            out = subprocess.run(chained, shell=True, input=raw, capture_output=True, text=True, timeout=5)
+            if out.stdout.strip():
+                print(out.stdout.rstrip("\n"))
+        except Exception:
+            pass
+
+
+USAGE_LIMIT_RE = re.compile(r"(usage|session|weekly|5-hour|opus|sonnet|fable) limit|hit your .{0,20}limit"
+                            r"|limit (reached|resets)", re.I)
+
+
+def cmd_hook():
+    """StopFailure hook: when a turn fails, ask Anthropic for this account's real usage. If
+    it is spent the wrapper switches within a second (you then just say "continue")."""
+    raw = sys.stdin.read()
+    acct = current_account()
+    if acct == "main":
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = {}
+    with open(STATE / "stopfailure.log", "a") as f:
+        f.write(f"{time.strftime('%F %T')} [{acct}] {payload.get('error')}: "
+                f"{(payload.get('last_assistant_message') or '')[:200]}\n")
+    if payload.get("error") == "authentication_failed":
+        return
+    if not fetch_usage(acct) and USAGE_LIMIT_RE.search(payload.get("last_assistant_message") or raw):
+        with locked():  # couldn't confirm: park it briefly; the next successful poll clears or confirms
+            st = state(acct)
+            reset = (st.get("five_hour") or {}).get("resets_at", 0)
+            st["blocked_until"] = reset if reset > time.time() else time.time() + 900
+            write_json(STATE / f"{acct}.json", st)
+
+
+# ---------- setup ----------
+
+def settings_path():
+    return MAIN_DIR / "settings.json"
+
+
+def self_command():
+    """How settings.json should call this script: via PATH if that resolves to this file."""
+    here = Path(__file__).resolve()
+    found = shutil.which("ccswap")
+    return found if found and Path(found).resolve() == here else shlex.quote(str(here))
+
+
+def is_ours(cmd):
+    return bool(re.search(r"ccswap[\"']? _(statusline|hook)\b", cmd or ""))
+
+
+def cmd_install():
+    sp = settings_path()
+    if sp.exists():
+        data = read_json(sp)
+        if data is None:
+            sys.exit(f"{sp} is not valid JSON; fix it first.")
+        backup = sp.with_name(f"settings.json.ccswap-backup-{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(sp, backup)
+        print(f"Backed up {sp} → {backup.name}")
+    else:
+        data = {}
+    me = self_command()
+    cfg = settings()
+    current = (data.get("statusLine") or {}).get("command")
+    if current and not is_ours(current):
+        cfg["chained_statusline"] = current
+        save_settings(cfg)
+        print("Kept your existing status line; it is shown under ccswap's.")
+    data["statusLine"] = {"type": "command", "command": f"{me} _statusline", "padding": 0}
+    hooks = data.setdefault("hooks", {})
+    entries = [e for e in hooks.get("StopFailure", [])
+               if not any(is_ours(h.get("command")) for h in e.get("hooks", []))]
+    entries.append({"hooks": [{"type": "command", "command": f"{me} _hook", "timeout": 15}]})
+    hooks["StopFailure"] = entries
+    write_json(sp, data)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    print(f"Wired the status line and StopFailure hook into {sp}.")
+    if not accounts():
+        print("\nNext steps:\n"
+              "  ccswap add work        # opens Claude Code: /login with that account, then /exit\n"
+              "  ccswap add personal    # repeat for every account\n"
+              "  ccswap default work    # optional: the account to use first\n"
+              "  ccswap                 # start Claude Code; accounts switch automatically")
+
+
+def cmd_uninstall(purge):
+    sp = settings_path()
+    data = read_json(sp, {}) or {}
+    cfg = settings()
+    if is_ours((data.get("statusLine") or {}).get("command")):
+        if cfg.get("chained_statusline"):
+            data["statusLine"] = {"type": "command", "command": cfg["chained_statusline"]}
+        else:
+            data.pop("statusLine", None)
+    hooks = data.get("hooks") or {}
+    if "StopFailure" in hooks:
+        hooks["StopFailure"] = [e for e in hooks["StopFailure"]
+                                if not any(is_ours(h.get("command")) for h in e.get("hooks", []))]
+        if not hooks["StopFailure"]:
+            hooks.pop("StopFailure")
+    if sp.exists():
+        write_json(sp, data)
+        print(f"Removed ccswap from {sp}.")
+    if purge:
+        if running_slots():
+            sys.exit("ccswap sessions are still running; exit them first.")
+        shutil.rmtree(ROOT, ignore_errors=True)
+        print(f"Deleted {ROOT} (saved logins and state).")
+    else:
+        print(f"Saved logins and state are still in {ROOT} (use --purge to delete them).")
+
+
+def cmd_doctor():
+    ok = True
+
+    def check(cond, good, bad):
+        nonlocal ok
+        print(("  ✓ " + good) if cond else ("  ✗ " + bad))
+        ok = ok and bool(cond)
+
+    print(f"ccswap {VERSION}")
+    check(sys.platform.startswith("linux"), "Linux / WSL",
+          f"unsupported platform {sys.platform}: ccswap needs Claude Code to keep logins in "
+          "~/.claude/.credentials.json (Linux / WSL); macOS keeps them in the Keychain")
+    check(sys.version_info >= (3, 9), f"Python {sys.version.split()[0]}", "Python 3.9+ is required")
+    claude = shutil.which("claude")
+    check(claude, f"claude found at {claude}", "claude is not on PATH")
+    if claude:
+        try:
+            v = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=20).stdout.strip()
+            print(f"    {v}")
+        except Exception:
+            pass
+    check(MAIN_DIR.is_dir(), f"shared Claude dir {MAIN_DIR}", f"{MAIN_DIR} does not exist (run claude once)")
+    data = read_json(settings_path(), {}) or {}
+    check(is_ours((data.get("statusLine") or {}).get("command")), "status line wired",
+          "status line not wired: run `ccswap install`")
+    check(any(is_ours(h.get("command")) for e in (data.get("hooks") or {}).get("StopFailure", [])
+              for h in e.get("hooks", [])), "StopFailure hook wired", "hook not wired: run `ccswap install`")
+    accts = accounts()
+    check(len(accts) >= 2, f"{len(accts)} accounts: {', '.join(accts)}",
+          f"{len(accts)} account(s) added; add at least two with `ccswap add <name>`")
+    for a in accts:
+        tok = (read_json(creds(a), {}) or {}).get("claudeAiOauth") or {}
+        check(tok.get("refreshToken"), f"{a}: logged in as {email(a)}",
+              f"{a}: not logged in (run `ccswap use {a}` and /login)")
+    emails = [email(a) for a in accts if email(a) != "?"]
+    check(len(emails) == len(set(emails)), "every account is a different login",
+          "two accounts share the same login; remove one with `ccswap rm`")
+    print("\nAll good." if ok else "\nFix the items marked ✗.")
+    return 0 if ok else 1
+
+
+# ---------- user commands ----------
+
+def cmd_ls():
+    poll_all(max_age=30)
+    now = time.time()
+    d = default_account()
+    accts = accounts()
+    if not accts:
+        return print("No accounts yet. Add one with `ccswap add <name>`.")
+    w_name = max(9, max(len(a) for a in accts) + 1)
+    w_mail = max(8, max(len(email(a)) for a in accts) + 2)
+    print(f"  {'account':<{w_name}}{'email':<{w_mail}}{'5h':>5} {'resets':<10}{'7d':>5} {'cap':>5} "
+          f"{'resets':<11}status")
+    for a in accts:
+        s = state(a)
+        f, w = s.get("five_hour") or {}, s.get("seven_day") or {}
+        b = blocked_until(a, now)
+        status = f"spent until {fmt_reset(b)}" if b else ("no data yet" if not s.get("updated") else "ok")
+        if not creds(a).exists():
+            status = "not logged in"
+        elif s.get("updated") and now - s["updated"] > 900:
+            status += f" (as of {fmt_reset(s['updated'])})"
+        if s.get("extra_usage"):
+            status += "  ⚠ extra usage ON"
+
+        def pct(win):
+            if "used_percentage" not in win:
+                return "-"
+            return f"{win['used_percentage'] if win.get('resets_at', 0) > now else 0:.0f}%"
+        mark = "★ " if a == d else "  "
+        print(f"{mark}{a:<{w_name}}{email(a):<{w_mail}}{pct(f):>5} {fmt_reset(f.get('resets_at')):<10}"
+              f"{pct(w):>5} {weekly_cap(a):>4.0f}% {fmt_reset(w.get('resets_at')):<11}{status}")
+    usable = usable_accounts(now=now)
+    if usable:
+        print("\nPick order" + (" (default first, then most urgent):" if d else " (most urgent first):"))
+        for i, a in enumerate(ordered(usable, now), 1):
+            p = plan(a, now)
+            tag = "default" if a == d else f"{p['urgency']:.2f} wk%/h"
+            print(f"  {i}. {a:<{w_name}}[{tag}] {p['why']}")
+        print(f"\nYour pace: ~{pace():.0f}% of a session per hour of work (learned).")
+    else:
+        print("\nEvery account is spent.")
+    running = running_slots()
+    if running:
+        print("\nRunning sessions:")
+        for sl in running:
+            print(f"  slot {sl.name} → {(sl / 'acct').read_text().strip()}")
+
+
+def cmd_add(name):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name in RESERVED:
+        sys.exit(f"invalid account name: {name}")
+    cfg = config_dir(name)
+    cfg.mkdir(parents=True, exist_ok=True)
+    link_shared(cfg)
+    gc = cfg / ".claude.json"
+    if not gc.exists():
+        main = main_global_config()
+        write_json(gc, {k: main[k] for k in ("mcpServers", "projects") if k in main})
+    print(f"Account '{name}' created at {cfg}")
+    print("Claude opens now: finish onboarding, run /login with that account, then /exit.")
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg))
+    for k in ("CLAUDECODE", "CCSWAP_SLOT"):
+        env.pop(k, None)
+    subprocess.call(["claude"], env=env)
+    if creds(name).exists():
+        fetch_usage(name)
+        dup = [a for a in accounts() if a != name and email(a) == email(name)]
+        print(f"\nLogged in as {email(name)}.")
+        if dup:
+            print(f"Warning: '{dup[0]}' is the same login. Remove one with `ccswap rm`.")
+    else:
+        print(f"\nNo login saved. Run `ccswap use {name}` and /login to finish.")
+
+
+def cmd_rm(name):
+    if name not in accounts():
+        sys.exit(f"unknown account {name}")
+    if any((sl / "acct").read_text().strip() == name for sl in running_slots()):
+        sys.exit(f"'{name}' is in use by a running session; exit it first.")
+    shutil.rmtree(ROOT / name)
+    (STATE / f"{name}.json").unlink(missing_ok=True)
+    cfg = settings()
+    if cfg.get("default") == name:
+        cfg["default"] = None
+    (cfg.get("weekly_cap") or {}).pop(name, None)
+    save_settings(cfg)
+    print(f"Removed account '{name}'.")
+
+
+def cmd_launch(args, forced=None):
+    if not sys.platform.startswith("linux"):
+        sys.exit("ccswap supports Linux and WSL only (see `ccswap doctor`).")
+    if not accounts():
+        sys.exit("No accounts yet. Add them with `ccswap add <name>` first.")
+    poll_all(max_age=60)
+    acct = forced or pick()
+    if not acct:
+        cmd_ls()
+        sys.exit("\nEvery account is spent. See the reset times above.")
+    slot = acquire_slot()
+    try:
+        prepare_slot(slot, acct)
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(slot / "config"), CCSWAP_SLOT=str(slot))
+        env.pop("CLAUDECODE", None)
+        print(f"\033[2mccswap: starting on '{acct}' ({email(acct)})\033[0m", file=sys.stderr)
+        # Ctrl-C belongs to claude; a no-op handler (unlike SIG_IGN) resets to default in the child.
+        signal.signal(signal.SIGINT, lambda *_: None)
+        proc = subprocess.Popen(["claude", *args], env=env)
+        flags = {}
+        while proc.poll() is None:
+            time.sleep(POLL)
+            try:
+                tick(slot, flags)
+            except Exception as e:  # never let bookkeeping take the session down
+                with open(STATE / "errors.log", "a") as f:
+                    f.write(f"{time.strftime('%F %T')} {e!r}\n")
+        try:
+            sync_creds(slot)
+        except Exception:
+            pass
+        return proc.returncode
+    finally:
+        (slot / "owner").unlink(missing_ok=True)
+
+
+def main():
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else None
+    if cmd == "_statusline":
+        return cmd_statusline()
+    if cmd == "_hook":
+        return cmd_hook()
+    if cmd in ("ls", "list", "status"):
+        return cmd_ls()
+    if cmd == "add":
+        if len(argv) != 2:
+            sys.exit("usage: ccswap add <name>")
+        return cmd_add(argv[1])
+    if cmd in ("rm", "remove"):
+        if len(argv) != 2:
+            sys.exit("usage: ccswap rm <name>")
+        return cmd_rm(argv[1])
+    if cmd == "use":
+        if len(argv) < 2 or argv[1] not in accounts():
+            sys.exit(f"usage: ccswap use <name> [claude args]; accounts: {', '.join(accounts()) or '(none)'}")
+        sys.exit(cmd_launch(argv[2:], forced=argv[1]))
+    if cmd == "unblock":
+        if len(argv) != 2 or argv[1] not in accounts():
+            sys.exit("usage: ccswap unblock <name>")
+        with locked():
+            s = state(argv[1])
+            s.pop("blocked_until", None)
+            write_json(STATE / f"{argv[1]}.json", s)
+        return
+    if cmd == "default":
+        cfg = settings()
+        if len(argv) == 1:
+            return print(default_account() or "(none)")
+        if argv[1] not in accounts() and argv[1] != "none":
+            sys.exit(f"unknown account {argv[1]}; accounts: {', '.join(accounts())}")
+        cfg["default"] = None if argv[1] == "none" else argv[1]
+        save_settings(cfg)
+        return print(f"default account: {cfg['default'] or '(none)'}")
+    if cmd == "cap":
+        cfg = settings()
+        if len(argv) == 1:
+            others = cfg.get("others_cap")
+            print(f"others (non-default): {f'{others:.0f}%' if others is not None else f'{THRESHOLD:.0f}% (no cap)'}")
+            for a in accounts():
+                print(f"  {a:<12} {weekly_cap(a):.0f}%{'  (default account)' if a == default_account() else ''}")
+            return
+        if len(argv) != 3 or (argv[1] != "--others" and argv[1] not in accounts()):
+            sys.exit("usage: ccswap cap <name|--others> <pct|reset>")
+        value = None if argv[2] == "reset" else max(1.0, min(100.0, float(argv[2].rstrip("%"))))
+        if argv[1] == "--others":
+            cfg["others_cap"] = value
+        else:
+            caps = cfg.setdefault("weekly_cap", {})
+            if value is None:
+                caps.pop(argv[1], None)
+            else:
+                caps[argv[1]] = value
+        save_settings(cfg)
+        return main_cap_summary()
+    if cmd == "install":
+        return cmd_install()
+    if cmd == "uninstall":
+        return cmd_uninstall("--purge" in argv)
+    if cmd == "doctor":
+        sys.exit(cmd_doctor())
+    if cmd in ("version", "--version", "-V"):
+        return print(f"ccswap {VERSION}")
+    if cmd in ("-h", "--help", "help"):
+        return print(__doc__)
+    sys.exit(cmd_launch(argv))
+
+
+def main_cap_summary():
+    for a in accounts():
+        print(f"  {a:<12} {weekly_cap(a):.0f}%{'  (default account)' if a == default_account() else ''}")
+
+
+if __name__ == "__main__":
+    main()

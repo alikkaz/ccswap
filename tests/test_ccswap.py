@@ -192,6 +192,7 @@ class Install(Base):
             ccswap.cmd_install()  # idempotent
         data = json.loads(sp.read_text())
         self.assertIn("_statusline", data["statusLine"]["command"])
+        self.assertEqual(data["statusLine"]["refreshInterval"], ccswap.STATUS_REFRESH)
         self.assertEqual(ccswap.settings()["chained_statusline"], "my-line")
         cmds = [h["command"] for e in data["hooks"]["StopFailure"] for h in e["hooks"]]
         self.assertEqual(sum("_hook" in c for c in cmds), 1)

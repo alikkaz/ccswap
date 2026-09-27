@@ -43,6 +43,7 @@ POLL = 1.0                              # seconds between checks while claude ru
 REBALANCE_EVERY = 60                    # seconds between urgency checks while running
 REBALANCE_MIN = float(os.environ.get("CCSWAP_REBALANCE_MIN", "10")) * 60
 POLL_EVERY = 180                        # seconds between usage polls per account
+STATUS_REFRESH = 30                     # seconds between status line redraws (Claude only redraws on events)
 K_PRIOR, K_WEIGHT = 0.10, 30.0          # weekly % per 1% of session: prior guess and its weight
 PACE_PRIOR, PACE_WEIGHT = 40.0, 1.0     # your pace in session-%/hour while working (prior, hours)
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -651,7 +652,8 @@ def cmd_install():
         cfg["chained_statusline"] = current
         save_settings(cfg)
         print("Kept your existing status line; it is shown under ccswap's.")
-    data["statusLine"] = {"type": "command", "command": f"{me} _statusline", "padding": 0}
+    data["statusLine"] = {"type": "command", "command": f"{me} _statusline", "padding": 0,
+                          "refreshInterval": STATUS_REFRESH}
     hooks = data.setdefault("hooks", {})
     entries = [e for e in hooks.get("StopFailure", [])
                if not any(is_ours(h.get("command")) for h in e.get("hooks", []))]

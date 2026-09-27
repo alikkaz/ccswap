@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `install` sets the status line's `refreshInterval` (30s). Claude Code only redraws the
+  status line on conversation events, so an idle session kept showing its first usage numbers
+
 ## 0.1.0 — 2026-09-27
 
 First release.

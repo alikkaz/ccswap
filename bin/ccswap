@@ -22,7 +22,7 @@ Environment:
   CCSWAP_HOME           where accounts and state live (default ~/.ccswap)
   CCSWAP_CLAUDE_DIR     the Claude config dir shared by all accounts (default ~/.claude)
   CCSWAP_THRESHOLD      % of a window at which an account counts as spent (default 99)
-  CCSWAP_REBALANCE_MIN  minimum minutes between optional rebalancing switches (default 10)
+  CCSWAP_REBALANCE_MIN  minimum minutes between a switch and returning to the default (default 10)
 
 See https://github.com/alikkaz/ccswap for how it works.
 """
@@ -338,15 +338,7 @@ def better_account(cur, now):
         return d            # the default has room again: go back to it
     if d and cur == d:
         return None         # on the default with room left: stay
-    here, there = plan(cur, now), plan(best, now)
-    if there["session_pool"] < 1:  # nothing meaningful to gain there right now
-        return None
-    if there["urgency"] > here["urgency"] * 1.25 + 0.2:
-        return best
-    # Both at your pace cap: prefer the one whose allowance runs out clearly sooner.
-    if abs(there["urgency"] - here["urgency"]) < 0.05 and there["raw"] > here["raw"] * 1.5:
-        return best
-    return None
+    return None             # otherwise stay until this account is spent
 
 
 # ---------- slots ----------
@@ -463,8 +455,7 @@ def tick(slot, flags):
         nxt = better_account(cur, now)
         if nxt:
             point_slot(slot, nxt)
-            why = "back to the default account" if nxt == default_account() else "its allowance expires sooner"
-            notify(f"Claude: switched {cur} → {nxt}", why)
+            notify(f"Claude: switched {cur} → {nxt}", "back to the default account")
         return
     nxt = pick(exclude={cur})
     if nxt:

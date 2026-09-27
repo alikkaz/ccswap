@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Stay on an account until it is spent. The watcher no longer moves a running session to
+  another account just because that account's allowance expires sooner; urgency now only
+  picks the next account. Returning to the default account once it has room is unchanged.
 - `install` sets the status line's `refreshInterval` (30s). Claude Code only redraws the
   status line on conversation events, so an idle session kept showing its first usage numbers
 

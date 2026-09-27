@@ -88,9 +88,9 @@ class Rebalancing(Base):
         self.accounts({"a": (30, 3, 40, 100), "b": (35, 2.8, 40, 100)})
         self.assertIsNone(ccswap.better_account("a", self.now))
 
-    def test_switch_when_other_weekly_about_to_be_lost(self):
+    def test_no_switch_before_spent_even_if_other_expires_sooner(self):
         self.accounts({"a": (30, 4, 20, 150), "b": (10, 4, 30, 8)})
-        self.assertEqual(ccswap.better_account("a", self.now), "b")
+        self.assertIsNone(ccswap.better_account("a", self.now))
 
     def test_no_switch_to_account_without_session_room(self):
         self.accounts({"a": (30, 4, 20, 150), "b": (98.5, 4, 30, 8)})

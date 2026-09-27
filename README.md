@@ -132,7 +132,7 @@ apply to the weekly window. The 5-hour window always goes to the threshold below
 | Variable | Default | Meaning |
 |---|---|---|
 | `CCSWAP_THRESHOLD` | `99` | % of a window at which an account counts as spent |
-| `CCSWAP_REBALANCE_MIN` | `10` | Minimum minutes between optional rebalancing switches |
+| `CCSWAP_REBALANCE_MIN` | `10` | Minimum minutes between a switch and returning to the default |
 | `CCSWAP_HOME` | `~/.ccswap` | Where saved logins, slots and state live |
 | `CCSWAP_CLAUDE_DIR` | `~/.claude` | The Claude config directory shared by all accounts |
 
@@ -142,8 +142,8 @@ apply to the weekly window. The 5-hour window always goes to the threshold below
 2. Each `ccswap` session runs Claude Code with `CLAUDE_CONFIG_DIR` set to a *slot*, a
    folder whose `.credentials.json` is a **symlink** to one account's login. Everything
    else in the slot is a symlink into `~/.claude`.
-3. A watcher checks every second. When the account is spent, or another account is
-   clearly more urgent, it re-points the symlink. The next request Claude Code makes goes
+3. A watcher checks every second. When the account is spent (or the default account
+   has room again), it re-points the symlink. The next request Claude Code makes goes
    out as the other account.
 4. Usage comes from Anthropic's usage endpoint (polled every few minutes for all
    accounts) and from the status line (on every reply for the current one).

@@ -32,7 +32,7 @@
      background, at most every 30 s),
   3. switch immediately if the current account is spent,
   4. once a minute (and at most once every `CCSWAP_REBALANCE_MIN` minutes), check
-     whether another account is clearly more urgent.
+     whether the default account has room again.
 
 ## Why a live switch works
 
@@ -98,15 +98,9 @@ urgency (the sooner or bigger loss) wins.
 4. While running:
    - switch **immediately** when the current account is spent;
    - switch **back to the default** once it frees up;
-   - otherwise switch only if another account is clearly more urgent
-     (`> 1.25 × current + 0.2`, or tied at the pace cap with a 1.5× sooner loss), has at
-     least 1 weekly-% of session room, and at least `CCSWAP_REBALANCE_MIN` minutes have
-     passed since the last switch. Each switch costs a fresh prompt-cache write, so
-     ccswap avoids switching back and forth.
-
-The result is "earliest deadline first": whatever would expire first gets used first.
-That's what keeps you from sitting idle waiting for a reset while another account's
-allowance goes unused.
+   - otherwise stay on the current account until it is spent. Urgency only decides
+     which account comes next, never whether to leave one that still has room. Each
+     switch costs a fresh prompt-cache write, so ccswap avoids switching early.
 
 ## Credentials
 

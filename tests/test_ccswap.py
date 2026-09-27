@@ -185,7 +185,8 @@ class Bookkeeping(Base):
 class Install(Base):
     def test_install_keeps_existing_statusline_and_hooks(self):
         sp = ccswap.settings_path()
-        sp.write_text(json.dumps({"statusLine": {"type": "command", "command": "my-line"},
+        previous = {"type": "command", "command": "my-line", "padding": 3, "refreshInterval": 17}
+        sp.write_text(json.dumps({"statusLine": previous,
                                   "hooks": {"StopFailure": [{"hooks": [{"type": "command", "command": "other"}]}]}}))
         with redirect_stdout(io.StringIO()):
             ccswap.cmd_install()
@@ -200,13 +201,36 @@ class Install(Base):
         with redirect_stdout(io.StringIO()):
             ccswap.cmd_uninstall(purge=False)
         data = json.loads(sp.read_text())
-        self.assertEqual(data["statusLine"]["command"], "my-line")
+        self.assertEqual(data["statusLine"], previous)
         self.assertEqual([h["command"] for e in data["hooks"]["StopFailure"] for h in e["hooks"]], ["other"])
+        self.assertNotIn("chained_statusline", ccswap.settings())
+        self.assertNotIn("chained_statusline_config", ccswap.settings())
 
     def test_install_refuses_broken_settings(self):
         ccswap.settings_path().write_text("{not json")
         with self.assertRaises(SystemExit):
             ccswap.cmd_install()
+
+    def test_uninstall_refuses_broken_settings_without_overwriting_it(self):
+        sp = ccswap.settings_path()
+        for broken in ("{not json", "[]", '{"statusLine": "not-an-object"}'):
+            with self.subTest(broken=broken):
+                sp.write_text(broken)
+                with self.assertRaises(SystemExit):
+                    ccswap.cmd_uninstall(purge=False)
+                self.assertEqual(sp.read_text(), broken)
+
+    def test_failed_purge_leaves_settings_wired(self):
+        sp = ccswap.settings_path()
+        sp.write_text(json.dumps({"statusLine": {"type": "command", "command": "ccswap _statusline"}}))
+        slot = ccswap.acquire_slot()
+        (slot / "acct").write_text("a")
+        before = sp.read_text()
+        with self.assertRaises(SystemExit):
+            ccswap.cmd_uninstall(purge=True)
+        self.assertEqual(sp.read_text(), before)
+        self.assertTrue(ccswap.ROOT.exists())
+        (slot / "owner").unlink()
 
 
 class Slots(Base):

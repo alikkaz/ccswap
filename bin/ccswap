@@ -629,8 +629,8 @@ def cmd_install():
     sp = settings_path()
     if sp.exists():
         data = read_json(sp)
-        if data is None:
-            sys.exit(f"{sp} is not valid JSON; fix it first.")
+        if not isinstance(data, dict):
+            sys.exit(f"{sp} must contain a JSON object; fix it first.")
         backup = sp.with_name(f"settings.json.ccswap-backup-{time.strftime('%Y%m%d-%H%M%S')}")
         shutil.copy2(sp, backup)
         print(f"Backed up {sp} → {backup.name}")
@@ -638,11 +638,20 @@ def cmd_install():
         data = {}
     me = self_command()
     cfg = settings()
-    current = (data.get("statusLine") or {}).get("command")
+    previous = data.get("statusLine")
+    if previous is not None and not isinstance(previous, dict):
+        sys.exit(f"{sp} has an invalid statusLine; fix it first.")
+    current = (previous or {}).get("command")
     if current and not is_ours(current):
         cfg["chained_statusline"] = current
+        cfg["chained_statusline_config"] = previous
         save_settings(cfg)
         print("Kept your existing status line; it is shown under ccswap's.")
+    elif not current:
+        # Do not let an old uninstall/reinstall cycle resurrect a status line the user removed.
+        cfg.pop("chained_statusline", None)
+        cfg.pop("chained_statusline_config", None)
+        save_settings(cfg)
     data["statusLine"] = {"type": "command", "command": f"{me} _statusline", "padding": 0,
                           "refreshInterval": STATUS_REFRESH}
     hooks = data.setdefault("hooks", {})
@@ -662,11 +671,25 @@ def cmd_install():
 
 
 def cmd_uninstall(purge):
+    # Refuse before unwiring anything so a failed purge leaves the installation intact.
+    if purge and running_slots():
+        sys.exit("ccswap sessions are still running; exit them first.")
     sp = settings_path()
-    data = read_json(sp, {}) or {}
+    if sp.exists():
+        data = read_json(sp)
+        if not isinstance(data, dict):
+            sys.exit(f"{sp} must contain a JSON object; fix it first.")
+    else:
+        data = {}
     cfg = settings()
-    if is_ours((data.get("statusLine") or {}).get("command")):
-        if cfg.get("chained_statusline"):
+    current = data.get("statusLine")
+    if current is not None and not isinstance(current, dict):
+        sys.exit(f"{sp} has an invalid statusLine; fix it first.")
+    if is_ours((current or {}).get("command")):
+        previous = cfg.get("chained_statusline_config")
+        if isinstance(previous, dict) and previous.get("command"):
+            data["statusLine"] = previous
+        elif cfg.get("chained_statusline"):  # installations made before full config preservation
             data["statusLine"] = {"type": "command", "command": cfg["chained_statusline"]}
         else:
             data.pop("statusLine", None)
@@ -680,11 +703,12 @@ def cmd_uninstall(purge):
         write_json(sp, data)
         print(f"Removed ccswap from {sp}.")
     if purge:
-        if running_slots():
-            sys.exit("ccswap sessions are still running; exit them first.")
         shutil.rmtree(ROOT, ignore_errors=True)
         print(f"Deleted {ROOT} (saved logins and state).")
     else:
+        cfg.pop("chained_statusline", None)
+        cfg.pop("chained_statusline_config", None)
+        save_settings(cfg)
         print(f"Saved logins and state are still in {ROOT} (use --purge to delete them).")
 
 

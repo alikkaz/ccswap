@@ -14,6 +14,7 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="ccswap-test-"))
@@ -35,6 +36,7 @@ class Base(unittest.TestCase):
         shutil.rmtree(TMP, ignore_errors=True)
         (TMP / "claude").mkdir(parents=True)
         ccswap.ROOT.mkdir(parents=True)
+        os.environ.pop("CCSWAP_INPUT_PROXY", None)
         self.now = time.time()
 
     def accounts(self, spec, default=None, caps=None, others=None):
@@ -144,6 +146,10 @@ class DefaultAndCaps(Base):
 
 
 class Bookkeeping(Base):
+    def test_iso_timestamp_accepts_z_on_python_39(self):
+        self.assertEqual(ccswap.iso_ts("2026-09-28T12:00:00Z"),
+                         ccswap.iso_ts("2026-09-28T12:00:00+00:00"))
+
     def test_merge_never_goes_down_within_a_window(self):
         old = {"used_percentage": 40, "resets_at": self.now + H}
         new = {"used_percentage": 35, "resets_at": self.now + H + 5}
@@ -182,12 +188,118 @@ class Bookkeeping(Base):
         self.assertGreater(ccswap.ratio(s), ccswap.K_PRIOR)
 
 
+class AutomaticContinue(Base):
+    def make_slot(self, acct):
+        slot = ccswap.acquire_slot()
+        ccswap.prepare_slot(slot, acct)
+        return slot
+
+    def request(self, slot, account, native_reset=0, force=False):
+        ccswap.write_json(slot / "resume.json", {"account": account, "requested_at": self.now - 1,
+                                                  "native_reset": native_reset, "force": force})
+
+    def test_switches_to_usable_account_then_resumes(self):
+        self.accounts({"spent": (100, 2, 20, 100), "ready": (10, 4, 20, 100)})
+        slot = self.make_slot("spent")
+        self.request(slot, "spent", self.now + 2 * H)
+        flags = {}
+        with patch.object(ccswap, "notify"):
+            self.assertIsNone(ccswap.resume_action(slot, flags, self.now))
+            self.assertEqual((slot / "acct").read_text(), "ready")
+            self.assertEqual(ccswap.resume_action(slot, flags, self.now + ccswap.AUTO_CONTINUE_SETTLE), "resume")
+        self.assertFalse((slot / "resume.json").exists())
+
+    def test_waits_until_one_of_all_spent_accounts_resets(self):
+        self.accounts({"a": (100, 2, 20, 100), "b": (100, 1, 20, 100)})
+        slot = self.make_slot("a")
+        self.request(slot, "a", self.now + 2 * H)
+        self.assertIsNone(ccswap.resume_action(slot, {}, self.now))
+        st = ccswap.state("b")
+        st["five_hour"]["resets_at"] = self.now - 1
+        ccswap.write_json(ccswap.STATE / "b.json", st)
+        flags = {}
+        with patch.object(ccswap, "notify"):
+            self.assertIsNone(ccswap.resume_action(slot, flags, self.now))
+            self.assertEqual((slot / "acct").read_text(), "b")
+            self.assertEqual(ccswap.resume_action(slot, flags, self.now + ccswap.AUTO_CONTINUE_SETTLE), "resume")
+
+    def test_native_auto_resume_gets_a_grace_period(self):
+        self.accounts({"a": (100, -1, 20, 100)})
+        slot = self.make_slot("a")
+        self.request(slot, "a", self.now)
+        self.assertIsNone(ccswap.resume_action(slot, {}, self.now + 1))
+        self.assertEqual(ccswap.resume_action(slot, {}, self.now + ccswap.AUTO_CONTINUE_GRACE), "resume")
+
+    def test_usage_correction_before_native_reset_resumes_immediately(self):
+        self.accounts({"a": (10, 4, 20, 100)})
+        slot = self.make_slot("a")
+        self.request(slot, "a", self.now + H)
+        self.assertEqual(ccswap.resume_action(slot, {}, self.now), "resume")
+
+    def test_stale_native_resume_forces_submission(self):
+        self.accounts({"a": (100, -1, 20, 100)})
+        slot = self.make_slot("a")
+        self.request(slot, "a", self.now, force=True)
+        self.assertEqual(ccswap.resume_action(slot, {}, self.now + 1), "resume")
+
+    def test_user_input_cancels_pending_resume(self):
+        self.accounts({"a": (10, 4, 20, 100)})
+        slot = self.make_slot("a")
+        self.request(slot, "a")
+        self.assertIsNone(ccswap.resume_action(slot, {"last_input": self.now}, self.now))
+        self.assertFalse((slot / "resume.json").exists())
+
+    def test_resume_keystrokes_preserve_a_draft(self):
+        self.assertEqual(ccswap.resume_keystrokes(), b"continue\r")
+        self.assertEqual(ccswap.resume_keystrokes(True), b"\x13continue\r")
+
+    def test_input_proxy_relays_user_input_and_injects_continue(self):
+        input_master, input_slave = os.openpty()
+        stream = os.fdopen(os.dup(input_slave), "rb", buffering=0)
+        proxy = None
+        try:
+            with patch.object(sys, "stdin", stream):
+                proxy = ccswap.InputProxy()
+                proxy.start()
+                ccswap.tty.setraw(proxy.slave_fd)
+                os.write(input_master, b"x")
+                self.assertTrue(proxy.pump(0.2))
+                self.assertEqual(os.read(proxy.slave_fd, 1), b"x")
+                proxy.inject_continue()
+                self.assertEqual(os.read(proxy.slave_fd, len(b"\x13continue\r")), b"\x13continue\r")
+        finally:
+            if proxy:
+                proxy.close()
+            stream.close()
+            os.close(input_master)
+            os.close(input_slave)
+
+    def test_stopfailure_queues_main_turn_but_not_agent_failure(self):
+        self.accounts({"a": (100, 2, 20, 100)})
+        slot = self.make_slot("a")
+        payload = {"hook_event_name": "StopFailure", "error": "rate_limit",
+                   "last_assistant_message": "You've hit your session limit"}
+        env = {"CCSWAP_SLOT": str(slot), "CCSWAP_INPUT_PROXY": "1"}
+        with patch.dict(os.environ, env), patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+                patch.object(ccswap, "fetch_usage", return_value=True):
+            ccswap.cmd_hook()
+        self.assertTrue((slot / "resume.json").exists())
+        ccswap.clear_resume(slot)
+        payload["agent_id"] = "agent-1"
+        with patch.dict(os.environ, env), patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+                patch.object(ccswap, "fetch_usage", return_value=True):
+            ccswap.cmd_hook()
+        self.assertFalse((slot / "resume.json").exists())
+
+
 class Install(Base):
     def test_install_keeps_existing_statusline_and_hooks(self):
         sp = ccswap.settings_path()
         previous = {"type": "command", "command": "my-line", "padding": 3, "refreshInterval": 17}
+        shared = [{"matcher": "x", "hooks": [{"type": "command", "command": "ccswap _hook"},
+                                               {"type": "command", "command": "other"}]}]
         sp.write_text(json.dumps({"statusLine": previous,
-                                  "hooks": {"StopFailure": [{"hooks": [{"type": "command", "command": "other"}]}]}}))
+                                  "hooks": {"StopFailure": shared, "Notification": shared}}))
         with redirect_stdout(io.StringIO()):
             ccswap.cmd_install()
             ccswap.cmd_install()  # idempotent
@@ -195,14 +307,16 @@ class Install(Base):
         self.assertIn("_statusline", data["statusLine"]["command"])
         self.assertEqual(data["statusLine"]["refreshInterval"], ccswap.STATUS_REFRESH)
         self.assertEqual(ccswap.settings()["chained_statusline"], "my-line")
-        cmds = [h["command"] for e in data["hooks"]["StopFailure"] for h in e["hooks"]]
-        self.assertEqual(sum("_hook" in c for c in cmds), 1)
-        self.assertIn("other", cmds)
+        for event in ("StopFailure", "Notification"):
+            cmds = [h["command"] for e in data["hooks"][event] for h in e["hooks"]]
+            self.assertEqual(sum("_hook" in c for c in cmds), 1)
+            self.assertIn("other", cmds)
         with redirect_stdout(io.StringIO()):
             ccswap.cmd_uninstall(purge=False)
         data = json.loads(sp.read_text())
         self.assertEqual(data["statusLine"], previous)
-        self.assertEqual([h["command"] for e in data["hooks"]["StopFailure"] for h in e["hooks"]], ["other"])
+        for event in ("StopFailure", "Notification"):
+            self.assertEqual([h["command"] for e in data["hooks"][event] for h in e["hooks"]], ["other"])
         self.assertNotIn("chained_statusline", ccswap.settings())
         self.assertNotIn("chained_statusline_config", ccswap.settings())
 

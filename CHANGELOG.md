@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Automatically recover a rate-limited interactive turn: switch to a usable account and
+  submit `continue`, or wait until the earliest account reset when all accounts are spent.
+  Coordinate with Claude Code's native quota auto-resume to avoid duplicate submissions;
+  user input cancels a queued resume.
+- Preserve unrelated handlers that share a Claude hook matcher group.
+- Accept UTC `Z` timestamps on the supported Python 3.9 baseline.
 - Make uninstall fail safely when Claude's settings are malformed, preserve the full
   pre-existing status-line configuration, and leave wiring untouched when `--purge`
   is refused because a ccswap session is still running.

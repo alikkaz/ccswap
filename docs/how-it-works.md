@@ -14,7 +14,8 @@
   claude  ── each request reads .credentials.json ──▶ Anthropic
      │
      ├─ status line: `ccswap _statusline`  (rate_limits of the current account, every reply)
-     └─ StopFailure hook: `ccswap _hook`   (a turn failed: re-check usage now)
+     ├─ StopFailure hook: `ccswap _hook`   (a turn failed: re-check usage now)
+     └─ Notification hook: `ccswap _hook`  (coordinate Claude's native quota auto-resume)
 ```
 
 - **Accounts.** `ccswap add <name>` creates `~/.ccswap/<name>/config` and runs Claude
@@ -32,7 +33,13 @@
      background, at most every 30 s),
   3. switch immediately if the current account is spent,
   4. once a minute (and at most once every `CCSWAP_REBALANCE_MIN` minutes), check
-     whether the default account has room again.
+     whether the default account has room again,
+  5. when a limit aborted the main turn, submit `continue` after an account becomes usable.
+
+For interactive sessions, the watcher places a PTY between your terminal input and
+Claude Code. User keystrokes pass through unchanged, but the watcher can also inject the
+resume prompt. Typing while a resume is queued cancels it. Non-interactive launches skip
+the relay.
 
 ## Why a live switch works
 
@@ -121,11 +128,20 @@ own API.
 ## Failed turns
 
 The `StopFailure` hook runs when a turn ends with an API error. ccswap logs it and
-immediately polls that account's real usage. If the account really is spent, the
-watcher switches within a second. A temporary rate-limit error (`429`) on an account
-with room left doesn't block it. If the poll can't be made, and the error message looks
-like a usage limit, the account is blocked until its 5-hour reset (or for 15 minutes
-if that isn't known). The next successful poll clears the block.
+immediately polls that account's real usage. If another account has room, the watcher
+switches and resumes the failed main turn. If every account is spent, the resume request
+stays queued until the scheduler finds the first usable account after a reset. Failures
+inside a background agent do not submit into the parent chat.
+
+Claude Code can also schedule its own quota auto-resume. A notification hook clears the
+ccswap request when that succeeds, or forces the PTY submit when Claude reports the
+auto-resume as stale or disabled. At the same account's reset, ccswap gives the native
+mechanism a short grace period to avoid a duplicate `continue`.
+
+A temporary rate-limit error (`429`) on an account with room left doesn't block it. If
+the usage poll can't be made and the error looks like a usage limit, the account is
+blocked until its 5-hour reset (or for 15 minutes if that isn't known). The next
+successful poll clears the block. Set `CCSWAP_AUTO_CONTINUE=0` to disable submission.
 
 ## Edge cases handled
 
@@ -138,8 +154,9 @@ if that isn't known). The next successful poll clears the block.
 - Accounts with extra usage (pay-as-you-go overage) turned on are flagged in
   `ccswap ls`.
 - Two accounts that are the same login are flagged by `ccswap add` and `ccswap doctor`.
-- An existing status line is kept (run after ccswap's, on the next line) and restored
-  by `ccswap uninstall`.
+- An existing status line is kept (run after ccswap's, on the next line), including its
+  options, and restored by `ccswap uninstall`. Existing handlers that share a hook matcher
+  group with ccswap are preserved.
 - `settings.json` is backed up before every `ccswap install`. Broken JSON is refused,
   not overwritten.
 - Ctrl-C goes to Claude Code, not the watcher.
@@ -151,7 +168,7 @@ if that isn't known). The next successful poll clears the block.
 | Path | Contents |
 |---|---|
 | `~/.ccswap/<account>/config/` | That account's login (`.credentials.json`, mode 600) and `.claude.json` |
-| `~/.ccswap/slots/N/` | Slot config dir, current account, last switch time, owning PID |
+| `~/.ccswap/slots/N/` | Slot config dir, current account, last switch time, queued resume, owning PID |
 | `~/.ccswap/state/<account>.json` | Last known usage, learned `k`, block state |
 | `~/.ccswap/state/_pace.json` | Learned working pace |
 | `~/.ccswap/state/stopfailure.log`, `errors.log` | Failed turns and watcher errors |

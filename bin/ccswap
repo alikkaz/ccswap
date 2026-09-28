@@ -23,10 +23,11 @@ Environment:
   CCSWAP_CLAUDE_DIR     the Claude config dir shared by all accounts (default ~/.claude)
   CCSWAP_THRESHOLD      % of a window at which an account counts as spent (default 99)
   CCSWAP_REBALANCE_MIN  minimum minutes between a switch and returning to the default (default 10)
+  CCSWAP_AUTO_CONTINUE  submit "continue" after a limit switch/reset (default 1; set 0 to disable)
 
 See https://github.com/alikkaz/ccswap for how it works.
 """
-import fcntl, json, os, re, shlex, shutil, signal, subprocess, sys, threading, time, urllib.request
+import fcntl, json, os, re, select, shlex, shutil, signal, subprocess, sys, termios, threading, time, tty, urllib.request
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,9 @@ POLL_EVERY = 180                        # seconds between usage polls per accoun
 STATUS_REFRESH = 30                     # seconds between status line redraws (Claude only redraws on events)
 K_PRIOR, K_WEIGHT = 0.10, 30.0          # weekly % per 1% of session: prior guess and its weight
 PACE_PRIOR, PACE_WEIGHT = 40.0, 1.0     # your pace in session-%/hour while working (prior, hours)
+AUTO_CONTINUE = os.environ.get("CCSWAP_AUTO_CONTINUE", "1") != "0"
+AUTO_CONTINUE_SETTLE = 1.0              # let Claude observe new credentials before submitting
+AUTO_CONTINUE_GRACE = 5.0               # give Claude's native quota auto-resume first chance
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -186,7 +190,9 @@ def merge_window(old, new, now):
 
 
 def iso_ts(value):
-    return datetime.fromisoformat(value).timestamp() if value else None
+    if not value:
+        return None
+    return datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value).timestamp()
 
 
 def oauth_get(url, token, timeout):
@@ -390,6 +396,7 @@ def main_global_config():
 
 
 def prepare_slot(slot, acct):
+    (slot / "resume.json").unlink(missing_ok=True)
     cfg = slot / "config"
     link_shared(cfg)
     # Per-slot global config, seeded from the account (onboarding, MCP servers, account info)
@@ -437,6 +444,59 @@ def sync_creds(slot):
     symlink(creds(acct), p)
 
 
+def pending_resume(slot):
+    return read_json(slot / "resume.json")
+
+
+def queue_resume(slot, acct, force=False):
+    """Ask the interactive wrapper to resume this failed turn when an account is usable."""
+    if not AUTO_CONTINUE or os.environ.get("CCSWAP_INPUT_PROXY") != "1":
+        return
+    p = slot / "resume.json"
+    old = read_json(p, {}) or {}
+    write_json(p, {"account": old.get("account", acct),
+                   "requested_at": old.get("requested_at", time.time()),
+                   "native_reset": old.get("native_reset") or blocked_until(acct),
+                   "force": bool(old.get("force") or force)})
+
+
+def clear_resume(slot):
+    (slot / "resume.json").unlink(missing_ok=True)
+
+
+def resume_keystrokes(has_draft=False):
+    """Ctrl-S preserves an unexpected draft via Claude's default chat:stash binding."""
+    return (b"\x13" if has_draft else b"") + b"continue\r"
+
+
+def resume_action(slot, flags, now):
+    request = pending_resume(slot)
+    if not request:
+        flags.pop("resume_ready_at", None)
+        return None
+    if flags.get("last_input", 0) > request.get("requested_at", 0):
+        clear_resume(slot)
+        flags.pop("resume_ready_at", None)
+        return None
+    cur = (slot / "acct").read_text().strip()
+    target = pick()
+    if not target:
+        return None
+    if target != cur:
+        point_slot(slot, target)
+        notify(f"Claude: switched {cur} → {target}", "resuming the failed turn")
+        flags["resume_ready_at"] = now + AUTO_CONTINUE_SETTLE
+    if now < flags.get("resume_ready_at", 0):
+        return None
+    native_reset = request.get("native_reset") or 0
+    if (not request.get("force") and target == request.get("account") and native_reset
+            and native_reset <= now < native_reset + AUTO_CONTINUE_GRACE):
+        return None
+    clear_resume(slot)
+    flags.pop("resume_ready_at", None)
+    return "resume"
+
+
 def tick(slot, flags):
     sync_creds(slot)
     cur = (slot / "acct").read_text().strip()
@@ -444,6 +504,9 @@ def tick(slot, flags):
     if now - flags.get("polled", 0) >= 30:
         flags["polled"] = now
         poll_all(wait=False)
+    action = resume_action(slot, flags, now)
+    if action:
+        return action
     if not blocked_until(cur):
         flags.pop("all_spent", None)
         if now - flags.get("checked", 0) < REBALANCE_EVERY:
@@ -584,28 +647,43 @@ USAGE_LIMIT_RE = re.compile(r"(usage|session|weekly|5-hour|opus|sonnet|fable) li
 
 
 def cmd_hook():
-    """StopFailure hook: when a turn fails, ask Anthropic for this account's real usage. If
-    it is spent the wrapper switches within a second (you then just say "continue")."""
+    """Refresh usage after failed turns and coordinate automatic quota recovery."""
     raw = sys.stdin.read()
     acct = current_account()
     if acct == "main":
         return
-    STATE.mkdir(parents=True, exist_ok=True)
     try:
         payload = json.loads(raw)
     except Exception:
         payload = {}
+    slot_value = os.environ.get("CCSWAP_SLOT")
+    if not slot_value:
+        return
+    slot = Path(slot_value)
+    if payload.get("hook_event_name") == "Notification":
+        kind = payload.get("notification_type")
+        if kind == "quota_auto_resume_fired":
+            clear_resume(slot)
+        elif kind in ("quota_auto_resume_stale", "quota_auto_resume_disabled"):
+            queue_resume(slot, acct, force=True)
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / "stopfailure.log", "a") as f:
         f.write(f"{time.strftime('%F %T')} [{acct}] {payload.get('error')}: "
                 f"{(payload.get('last_assistant_message') or '')[:200]}\n")
     if payload.get("error") == "authentication_failed":
         return
-    if not fetch_usage(acct) and USAGE_LIMIT_RE.search(payload.get("last_assistant_message") or raw):
+    is_limit = bool(USAGE_LIMIT_RE.search(payload.get("last_assistant_message") or raw))
+    if not fetch_usage(acct) and is_limit:
         with locked():  # couldn't confirm: park it briefly; the next successful poll clears or confirms
             st = state(acct)
             reset = (st.get("five_hour") or {}).get("resets_at", 0)
             st["blocked_until"] = reset if reset > time.time() else time.time() + 900
             write_json(STATE / f"{acct}.json", st)
+    # Agent failures are reported inside their parent turn. Let the parent/native quota
+    # handling decide whether the chat itself needs another submit.
+    if is_limit and not payload.get("agent_id") and blocked_until(acct) > time.time():
+        queue_resume(slot, acct)
 
 
 # ---------- setup ----------
@@ -623,6 +701,23 @@ def self_command():
 
 def is_ours(cmd):
     return bool(re.search(r"ccswap[\"']? _(statusline|hook)\b", cmd or ""))
+
+
+def without_our_hooks(entries):
+    """Remove only ccswap handlers, preserving siblings in the same matcher group."""
+    clean = []
+    for entry in entries:
+        handlers = [h for h in entry.get("hooks", []) if not is_ours(h.get("command"))]
+        if handlers:
+            copy = dict(entry)
+            copy["hooks"] = handlers
+            clean.append(copy)
+    return clean
+
+
+def hook_installed(data, event):
+    return any(is_ours(h.get("command")) for e in (data.get("hooks") or {}).get(event, [])
+               for h in e.get("hooks", []))
 
 
 def cmd_install():
@@ -655,13 +750,16 @@ def cmd_install():
     data["statusLine"] = {"type": "command", "command": f"{me} _statusline", "padding": 0,
                           "refreshInterval": STATUS_REFRESH}
     hooks = data.setdefault("hooks", {})
-    entries = [e for e in hooks.get("StopFailure", [])
-               if not any(is_ours(h.get("command")) for h in e.get("hooks", []))]
+    entries = without_our_hooks(hooks.get("StopFailure", []))
     entries.append({"hooks": [{"type": "command", "command": f"{me} _hook", "timeout": 15}]})
     hooks["StopFailure"] = entries
+    entries = without_our_hooks(hooks.get("Notification", []))
+    entries.append({"matcher": "quota_auto_resume_(fired|stale|disabled)",
+                    "hooks": [{"type": "command", "command": f"{me} _hook", "timeout": 15}]})
+    hooks["Notification"] = entries
     write_json(sp, data)
     ROOT.mkdir(parents=True, exist_ok=True)
-    print(f"Wired the status line and StopFailure hook into {sp}.")
+    print(f"Wired the status line and recovery hooks into {sp}.")
     if not accounts():
         print("\nNext steps:\n"
               "  ccswap add work        # opens Claude Code: /login with that account, then /exit\n"
@@ -694,11 +792,11 @@ def cmd_uninstall(purge):
         else:
             data.pop("statusLine", None)
     hooks = data.get("hooks") or {}
-    if "StopFailure" in hooks:
-        hooks["StopFailure"] = [e for e in hooks["StopFailure"]
-                                if not any(is_ours(h.get("command")) for h in e.get("hooks", []))]
-        if not hooks["StopFailure"]:
-            hooks.pop("StopFailure")
+    for event in ("StopFailure", "Notification"):
+        if event in hooks:
+            hooks[event] = without_our_hooks(hooks[event])
+            if not hooks[event]:
+                hooks.pop(event)
     if sp.exists():
         write_json(sp, data)
         print(f"Removed ccswap from {sp}.")
@@ -737,8 +835,10 @@ def cmd_doctor():
     data = read_json(settings_path(), {}) or {}
     check(is_ours((data.get("statusLine") or {}).get("command")), "status line wired",
           "status line not wired: run `ccswap install`")
-    check(any(is_ours(h.get("command")) for e in (data.get("hooks") or {}).get("StopFailure", [])
-              for h in e.get("hooks", [])), "StopFailure hook wired", "hook not wired: run `ccswap install`")
+    check(hook_installed(data, "StopFailure"), "StopFailure hook wired",
+          "StopFailure hook not wired: run `ccswap install`")
+    check(hook_installed(data, "Notification"), "quota notification hook wired",
+          "quota notification hook not wired: run `ccswap install`")
     accts = accounts()
     check(len(accts) >= 2, f"{len(accts)} accounts: {', '.join(accts)}",
           f"{len(accts)} account(s) added; add at least two with `ccswap add <name>`")
@@ -843,6 +943,80 @@ def cmd_rm(name):
     print(f"Removed account '{name}'.")
 
 
+class InputProxy:
+    """Relay the user's terminal input through a PTY so the watcher can submit a prompt."""
+
+    def __init__(self):
+        self.input_fd = sys.stdin.fileno()
+        self.master_fd, self.slave_fd = os.openpty()
+        self.saved_termios = None
+        self.has_draft = False
+
+    def start(self):
+        self._copy_winsize()
+        self.saved_termios = termios.tcgetattr(self.input_fd)
+        tty.setraw(self.input_fd)
+
+    def child_started(self):
+        os.close(self.slave_fd)
+        self.slave_fd = None
+
+    def _copy_winsize(self):
+        try:
+            size = fcntl.ioctl(self.input_fd, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, size)
+        except OSError:
+            pass
+
+    def pump(self, timeout):
+        try:
+            ready, _, _ = select.select([self.input_fd], [], [], timeout)
+            if not ready:
+                return False
+            data = os.read(self.input_fd, 4096)
+            if not data:
+                return False
+            self._write(data)
+            self._track_draft(data)
+            return True
+        except (InterruptedError, OSError):
+            return False
+
+    def _track_draft(self, data):
+        for byte in data:
+            if byte in (10, 13):
+                self.has_draft = False
+            elif byte in (8, 127):
+                self.has_draft = False
+            elif byte == 9 or byte >= 32:
+                self.has_draft = True
+
+    def _write(self, data):
+        view = memoryview(data)
+        while view:
+            view = view[os.write(self.master_fd, view):]
+
+    def inject_continue(self):
+        self._write(resume_keystrokes(self.has_draft))
+        self.has_draft = False
+
+    def close(self):
+        if self.saved_termios is not None:
+            try:
+                termios.tcsetattr(self.input_fd, termios.TCSADRAIN, self.saved_termios)
+            except termios.error:
+                pass
+            self.saved_termios = None
+        for name in ("slave_fd", "master_fd"):
+            fd = getattr(self, name, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, name, None)
+
+
 def cmd_launch(args, forced=None):
     if not sys.platform.startswith("linux"):
         sys.exit("ccswap supports Linux and WSL only (see `ccswap doctor`).")
@@ -854,19 +1028,40 @@ def cmd_launch(args, forced=None):
         cmd_ls()
         sys.exit("\nEvery account is spent. See the reset times above.")
     slot = acquire_slot()
+    proxy = InputProxy() if AUTO_CONTINUE and sys.stdin.isatty() else None
     try:
         prepare_slot(slot, acct)
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(slot / "config"), CCSWAP_SLOT=str(slot))
         env.pop("CLAUDECODE", None)
+        env.pop("CCSWAP_INPUT_PROXY", None)
+        if proxy:
+            proxy.start()
+            env["CCSWAP_INPUT_PROXY"] = "1"
         print(f"\033[2mccswap: starting on '{acct}' ({email(acct)})\033[0m", file=sys.stderr)
         # Ctrl-C belongs to claude; a no-op handler (unlike SIG_IGN) resets to default in the child.
         signal.signal(signal.SIGINT, lambda *_: None)
-        proc = subprocess.Popen(["claude", *args], env=env)
+        proc = subprocess.Popen(["claude", *args], env=env, stdin=proxy.slave_fd if proxy else None)
+        if proxy:
+            proxy.child_started()
         flags = {}
+        next_tick = time.monotonic() + POLL
         while proc.poll() is None:
-            time.sleep(POLL)
+            wait = max(0.0, next_tick - time.monotonic())
+            activity = proxy.pump(wait) if proxy else (time.sleep(wait) or False)
+            if activity:
+                flags["last_input"] = time.time()
+                clear_resume(slot)
+                flags.pop("resume_ready_at", None)
+            if time.monotonic() < next_tick:
+                continue
+            next_tick = time.monotonic() + POLL
             try:
-                tick(slot, flags)
+                action = tick(slot, flags)
+                if action == "resume" and proxy:
+                    proxy.inject_continue()
+                    notify("Claude: session resumed", "submitted continue after the account became usable")
+                if proxy:
+                    proxy._copy_winsize()
             except Exception as e:  # never let bookkeeping take the session down
                 with open(STATE / "errors.log", "a") as f:
                     f.write(f"{time.strftime('%F %T')} {e!r}\n")
@@ -876,6 +1071,8 @@ def cmd_launch(args, forced=None):
             pass
         return proc.returncode
     finally:
+        if proxy:
+            proxy.close()
         (slot / "owner").unlink(missing_ok=True)
 
 
